@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Any, List, Optional
+from typing import Any, List, Optional, OrderedDict
 
 import torch
 from torch import nn
@@ -44,6 +44,26 @@ class DeepLabV3(_SimpleSegmentationModel):
 
     pass
 
+class DeepLabV3Plus(_SimpleSegmentationModel):
+    def forward(self, x):
+        input_shape = x.shape[-2:]
+        # contract: features is a dict of tensors
+        features = self.backbone(x)
+
+        result = OrderedDict()
+        x = self.classifier(features)
+        x = F.interpolate(x, size=input_shape, mode="bilinear", align_corners=False)
+        result["out"] = x
+
+        if self.aux_classifier is not None:
+            x = features["aux"]
+            x = self.aux_classifier(x)
+            x = F.interpolate(x, size=input_shape, mode="bilinear", align_corners=False)
+            result["aux"] = x
+
+        return result
+
+
 
 class DeepLabHead(nn.Sequential):
     def __init__(self, in_channels: int, num_classes: int) -> None:
@@ -54,6 +74,38 @@ class DeepLabHead(nn.Sequential):
             nn.ReLU(),
             nn.Conv2d(256, num_classes, 1),
         )
+
+class DeepLabPlusHead(nn.Module):
+    def __init__(self, in_channels: int, low_level_channels: int,  num_classes: int) -> None:
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Conv2d(low_level_channels, 48, 1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+        )
+        self.aspp = ASPP(in_channels, [12, 24, 36])
+        self.classifier = nn.Sequential(
+            nn.Conv2d(304, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, num_classes, 1),
+        )
+        self._init_weights()
+
+    def forward(self, feature):
+        low_level_feature = self.project(feature['low_level'])
+        high_level_feature = self.aspp(feature['out'])
+        upscale_hl_feature = F.interpolate(high_level_feature, size=low_level_feature.shape[-2:], mode='bilinear', align_corners=False)
+        combined_feature = torch.cat([low_level_feature, upscale_hl_feature], dim=1)
+        return self.classifier(combined_feature)
+
+    def _init_weights(self): # need to do this because we have no pretraining for DeepLabV3+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
 
 class ASPPConv(nn.Sequential):
@@ -117,15 +169,22 @@ def _deeplabv3_resnet(
     backbone: ResNet,
     num_classes: int,
     aux: Optional[bool],
+    plus: Optional[bool]=False
 ) -> DeepLabV3:
     return_layers = {"layer4": "out"}
+    if plus:
+        return_layers["layer1"] = "low_level"
     if aux:
         return_layers["layer3"] = "aux"
     backbone = IntermediateLayerGetter(backbone, return_layers=return_layers)
 
     aux_classifier = FCNHead(1024, num_classes) if aux else None
-    classifier = DeepLabHead(2048, num_classes)
-    return DeepLabV3(backbone, classifier, aux_classifier)
+    classifier = DeepLabPlusHead(2048, 256, num_classes) if plus else DeepLabHead(2048, num_classes)
+
+    if plus:
+        return DeepLabV3Plus(backbone, classifier, aux_classifier)
+    else:
+        return DeepLabV3(backbone, classifier, aux_classifier)
 
 
 _COMMON_META = {
@@ -307,6 +366,54 @@ def deeplabv3_resnet101(
 
     backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
     model = _deeplabv3_resnet(backbone, num_classes, aux_loss)
+
+    if weights is not None:
+        model.load_state_dict(weights.get_state_dict(progress=progress))
+
+    return model
+
+def deeplabv3plus_resnet101(
+    *,
+    weights: Optional[DeepLabV3_ResNet101_Weights] = None,
+    progress: bool = True,
+    num_classes: Optional[int] = None,
+    aux_loss: Optional[bool] = None,
+    weights_backbone: Optional[ResNet101_Weights] = ResNet101_Weights.IMAGENET1K_V1,
+    **kwargs: Any,
+) -> DeepLabV3:
+    """Constructs a DeepLabV3 model with a ResNet-101 backbone.
+
+    Reference: `Rethinking Atrous Convolution for Semantic Image Segmentation <https://arxiv.org/abs/1706.05587>`__.
+
+    Args:
+        weights (:class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights`, optional): The
+            pretrained weights to use. See
+            :class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights` below for
+            more details, and possible values. By default, no pre-trained
+            weights are used.
+        progress (bool, optional): If True, displays a progress bar of the
+            download to stderr. Default is True.
+        num_classes (int, optional): number of output classes of the model (including the background)
+        aux_loss (bool, optional): If True, it uses an auxiliary loss
+        weights_backbone (:class:`~torchvision.models.ResNet101_Weights`, optional): The pretrained weights for the
+            backbone
+        **kwargs: unused
+
+    .. autoclass:: torchvision.models.segmentation.DeepLabV3_ResNet101_Weights
+        :members:
+    """
+    weights = DeepLabV3_ResNet101_Weights.verify(weights)
+    weights_backbone = ResNet101_Weights.verify(weights_backbone)
+
+    if weights is not None:
+        weights_backbone = None
+        num_classes = _ovewrite_value_param(num_classes, len(weights.meta["categories"]))
+        aux_loss = _ovewrite_value_param(aux_loss, True)
+    elif num_classes is None:
+        num_classes = 21
+
+    backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
+    model = _deeplabv3_resnet(backbone, num_classes, aux_loss, plus=True)
 
     if weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))
