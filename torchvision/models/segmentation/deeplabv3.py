@@ -63,7 +63,37 @@ class DeepLabV3Plus(_SimpleSegmentationModel):
 
         return result
 
+class MultiTaskModel(nn.Module):
+    def __init__(
+        self, backbone: nn.Module, 
+        height_decoder: nn.Module, seg_decoder: nn.Module, aux_classifier: Optional[nn.Module] = None
+        ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.height_decoder = height_decoder
+        self.seg_decoder = seg_decoder
+        self.aux_classifier = aux_classifier
 
+    def forward(self, x):
+        input_shape = x.shape[-2:]
+        # contract: features is a dict of tensors
+        features = self.backbone(x)
+
+        result = OrderedDict()
+        height_x = self.height_decoder(features)
+        seg_x = self.seg_decoder(features)
+        height_x = F.interpolate(height_x, size=input_shape, mode="bilinear", align_corners=False)
+        seg_x = F.interpolate(seg_x, size=input_shape, mode="bilinear", align_corners=False)
+        result["height_out"] = height_x
+        result["seg_out"] = seg_x
+
+        if self.aux_classifier is not None:
+            x = features["aux"]
+            x = self.aux_classifier(x)
+            x = F.interpolate(x, size=input_shape, mode="bilinear", align_corners=False)
+            result["aux"] = x
+
+        return result
 
 class DeepLabHead(nn.Sequential):
     def __init__(self, in_channels: int, num_classes: int) -> None:
@@ -186,6 +216,71 @@ def _deeplabv3_resnet(
     else:
         return DeepLabV3(backbone, classifier, aux_classifier)
 
+def _multitask_model(
+    backbone: ResNet,
+    num_seg_classes: int,
+    aux: Optional[bool]
+) -> MultiTaskModel:
+    return_layers = {"layer4": "out", "layer1": "low_level"}
+    if aux:
+        return_layers["layer3"] = "aux"
+    backbone = IntermediateLayerGetter(backbone, return_layers=return_layers)
+
+    aux_classifier = FCNHead(1024, num_seg_classes) if aux else None # kind of useless tbh
+    height_decoder = DeepLabPlusHead(2048, 256, 1) # always one channel for height
+    seg_decoder = DeepLabPlusHead(2048, 256, num_seg_classes)
+
+    return MultiTaskModel(backbone, height_decoder, seg_decoder, aux_classifier)
+
+def multitask_model(
+    *,
+    weights: Optional[ResNet101_Weights] = None,
+    progress: bool = True,
+    num_seg_classes: Optional[int] = None,
+    aux_loss: Optional[bool] = None,
+    weights_backbone: Optional[ResNet101_Weights] = ResNet101_Weights.IMAGENET1K_V2,
+    **kwargs: Any,
+) -> DeepLabV3:
+    """Constructs a multitask model with a ResNet-101 backbone and decoder heads for DSM height and surface segmentation.
+    Based on DeepLabV3+
+
+    Reference: `Rethinking Atrous Convolution for Semantic Image Segmentation <https://arxiv.org/abs/1706.05587>`__.
+    Reference: `Encoder-Decoder with Atrous Separable Convolution for Semantic Image Segmentation <https://arxiv.org/pdf/1802.02611>`__.
+
+    Args:
+        weights (:class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights`, optional): The
+            pretrained weights to use. See
+            :class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights` below for
+            more details, and possible values. By default, no pre-trained
+            weights are used.
+        progress (bool, optional): If True, displays a progress bar of the
+            download to stderr. Default is True.
+        num_seg_classes (int, optional): number of output classes of the model (including the background)
+        aux_loss (bool, optional): If True, it uses an auxiliary loss
+        weights_backbone (:class:`~torchvision.models.ResNet101_Weights`, optional): The pretrained weights for the
+            backbone
+        **kwargs: unused
+
+    .. autoclass:: torchvision.models.segmentation.DeepLabV3_ResNet101_Weights
+        :members:
+    """
+    seg_weights = DeepLabV3_ResNet101_Weights.verify(weights)
+    weights_backbone = ResNet101_Weights.verify(weights_backbone)
+
+    if seg_weights is not None:
+        weights_backbone = None
+        num_seg_classes = _ovewrite_value_param(num_seg_classes, len(weights.meta["categories"]))
+        aux_loss = _ovewrite_value_param(aux_loss, True)
+    elif num_seg_classes is None:
+        num_seg_classes = 21
+
+    backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
+    model = _multitask_model(backbone, num_seg_classes, aux_loss)
+
+    if seg_weights is not None:
+        model.load_state_dict(weights.get_state_dict(progress=progress))
+
+    return model
 
 _COMMON_META = {
     "categories": _VOC_CATEGORIES,
@@ -378,10 +473,10 @@ def deeplabv3plus_resnet101(
     progress: bool = True,
     num_classes: Optional[int] = None,
     aux_loss: Optional[bool] = None,
-    weights_backbone: Optional[ResNet101_Weights] = ResNet101_Weights.IMAGENET1K_V1,
+    weights_backbone: Optional[ResNet101_Weights] = ResNet101_Weights.IMAGENET1K_V2,
     **kwargs: Any,
 ) -> DeepLabV3:
-    """Constructs a DeepLabV3 model with a ResNet-101 backbone.
+    """Constructs a DeepLabV3+ model with a ResNet-101 backbone.
 
     Reference: `Rethinking Atrous Convolution for Semantic Image Segmentation <https://arxiv.org/abs/1706.05587>`__.
 
