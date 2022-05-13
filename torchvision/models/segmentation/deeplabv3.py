@@ -84,8 +84,8 @@ class MultiTaskModel(nn.Module):
         seg_x = self.seg_decoder(features)
         height_x = F.interpolate(height_x, size=input_shape, mode="bilinear", align_corners=False)
         seg_x = F.interpolate(seg_x, size=input_shape, mode="bilinear", align_corners=False)
-        result["height_out"] = height_x
-        result["seg_out"] = seg_x
+        result["height"] = height_x
+        result["segmentation"] = seg_x
 
         if self.aux_classifier is not None:
             x = features["aux"]
