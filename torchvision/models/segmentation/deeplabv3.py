@@ -10,7 +10,7 @@ from .._api import WeightsEnum, Weights
 from .._meta import _VOC_CATEGORIES
 from .._utils import IntermediateLayerGetter, handle_legacy_interface, _ovewrite_value_param
 from ..mobilenetv3 import MobileNetV3, MobileNet_V3_Large_Weights, mobilenet_v3_large
-from ..resnet import ResNet, resnet50, resnet101, ResNet50_Weights, ResNet101_Weights
+from ..resnet import ResNet, resnet50, resnet101_1ch, ResNet50_Weights, ResNet101_Weights
 from ._utils import _SimpleSegmentationModel
 from .fcn import FCNHead
 
@@ -65,20 +65,24 @@ class DeepLabV3Plus(_SimpleSegmentationModel):
 
 class MultiTaskModel(nn.Module):
     def __init__(
-        self, backbone: nn.Module, 
+        self, backbones: List[nn.Module], 
         height_decoder: nn.Module, seg_decoder: nn.Module, aux_classifier: Optional[nn.Module] = None
         ) -> None:
         super().__init__()
-        self.backbone = backbone
+        self.backbones = backbones
         self.height_decoder = height_decoder
         self.seg_decoder = seg_decoder
         self.aux_classifier = aux_classifier
 
     def forward(self, x):
         input_shape = x.shape[-2:]
+        assert x.shape[1] == len(self.backbones), 'channels in input not equal to number of encoders!'
         # contract: features is a dict of tensors
-        features = self.backbone(x)
-
+        features_list = [ backbone(x[:,i:i+1]) for i, backbone in enumerate(self.backbones) ]
+        features = {
+            'low_level': torch.cat([f['low_level'] for f in features_list], dim=1),
+            'out': torch.cat([f['out'] for f in features_list], dim=1)
+        }
         result = OrderedDict()
         height_x = self.height_decoder(features)
         seg_x = self.seg_decoder(features)
@@ -217,20 +221,22 @@ def _deeplabv3_resnet(
         return DeepLabV3(backbone, classifier, aux_classifier)
 
 def _multitask_model(
-    backbone: ResNet,
+    backbones: List[nn.Module],
     num_seg_classes: int,
     aux: Optional[bool]
 ) -> MultiTaskModel:
     return_layers = {"layer4": "out", "layer1": "low_level"}
     if aux:
         return_layers["layer3"] = "aux"
-    backbone = IntermediateLayerGetter(backbone, return_layers=return_layers)
+    backbones = [
+        IntermediateLayerGetter(backbone, return_layers=return_layers) for backbone in backbones
+    ]
 
     aux_classifier = FCNHead(1024, num_seg_classes) if aux else None # kind of useless tbh
     height_decoder = DeepLabPlusHead(2048, 256, 1) # always one channel for height
     seg_decoder = DeepLabPlusHead(2048, 256, num_seg_classes)
 
-    return MultiTaskModel(backbone, height_decoder, seg_decoder, aux_classifier)
+    return MultiTaskModel(backbones, height_decoder, seg_decoder, aux_classifier)
 
 def multitask_model(
     *,
@@ -276,6 +282,60 @@ def multitask_model(
 
     backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
     model = _multitask_model(backbone, num_seg_classes, aux_loss)
+
+    if seg_weights is not None:
+        model.load_state_dict(weights.get_state_dict(progress=progress))
+
+    return model
+
+def multitask_model_multi_encoder(
+    *,
+    num_encoders = 1,
+    weights: Optional[ResNet101_Weights] = None,
+    progress: bool = True,
+    num_seg_classes: Optional[int] = None,
+    aux_loss: Optional[bool] = None,
+    weights_backbone: Optional[ResNet101_Weights] = ResNet101_Weights.IMAGENET1K_V2,
+    **kwargs: Any,
+) -> DeepLabV3:
+    """Constructs a multitask model with a ResNet-101 backbone and decoder heads for DSM height and surface segmentation.
+    Based on DeepLabV3+
+
+    Reference: `Rethinking Atrous Convolution for Semantic Image Segmentation <https://arxiv.org/abs/1706.05587>`__.
+    Reference: `Encoder-Decoder with Atrous Separable Convolution for Semantic Image Segmentation <https://arxiv.org/pdf/1802.02611>`__.
+
+    Args:
+        weights (:class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights`, optional): The
+            pretrained weights to use. See
+            :class:`~torchvision.models.segmentation.DeepLabV3_ResNet101_Weights` below for
+            more details, and possible values. By default, no pre-trained
+            weights are used.
+        progress (bool, optional): If True, displays a progress bar of the
+            download to stderr. Default is True.
+        num_seg_classes (int, optional): number of output classes of the model (including the background)
+        aux_loss (bool, optional): If True, it uses an auxiliary loss
+        weights_backbone (:class:`~torchvision.models.ResNet101_Weights`, optional): The pretrained weights for the
+            backbone
+        **kwargs: unused
+
+    .. autoclass:: torchvision.models.segmentation.DeepLabV3_ResNet101_Weights
+        :members:
+    """
+    seg_weights = DeepLabV3_ResNet101_Weights.verify(weights)
+    # weights_backbone = ResNet101_Weights.verify(weights_backbone)
+    weights_backbone = None # no pre-trained model available for single channel
+
+    if seg_weights is not None:
+        weights_backbone = None
+        num_seg_classes = _ovewrite_value_param(num_seg_classes, len(weights.meta["categories"]))
+        aux_loss = _ovewrite_value_param(aux_loss, True)
+    elif num_seg_classes is None:
+        num_seg_classes = 21
+
+    backbones = [
+        resnet101_1ch(weights=weights_backbone, replace_stride_with_dilation=[False, True, True]) for _ in range(num_encoders)
+    ]
+    model = _multitask_model(backbones, num_seg_classes, aux_loss)
 
     if seg_weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))

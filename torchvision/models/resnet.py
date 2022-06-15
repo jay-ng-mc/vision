@@ -28,6 +28,7 @@ __all__ = [
     "resnet34",
     "resnet50",
     "resnet101",
+    "resnet101_1ch",
     "resnet152",
     "resnext50_32x4d",
     "resnext101_32x8d",
@@ -168,6 +169,7 @@ class ResNet(nn.Module):
         self,
         block: Type[Union[BasicBlock, Bottleneck]],
         layers: List[int],
+        in_img_chs: int,
         num_classes: int = 1000,
         zero_init_residual: bool = False,
         groups: int = 1,
@@ -194,7 +196,7 @@ class ResNet(nn.Module):
             )
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv2d(in_img_chs, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
@@ -290,12 +292,13 @@ def _resnet(
     layers: List[int],
     weights: Optional[WeightsEnum],
     progress: bool,
+    in_img_chs: int = 3,
     **kwargs: Any,
 ) -> ResNet:
     if weights is not None:
         _ovewrite_named_param(kwargs, "num_classes", len(weights.meta["categories"]))
 
-    model = ResNet(block, layers, **kwargs)
+    model = ResNet(block, layers, in_img_chs, **kwargs)
 
     if weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))
@@ -669,6 +672,29 @@ def resnet101(*, weights: Optional[ResNet101_Weights] = None, progress: bool = T
     weights = ResNet101_Weights.verify(weights)
 
     return _resnet(Bottleneck, [3, 4, 23, 3], weights, progress, **kwargs)
+
+def resnet101_1ch(*, weights: Optional[ResNet101_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
+    """ResNet-101 from `Deep Residual Learning for Image Recognition <https://arxiv.org/pdf/1512.03385.pdf>`__.
+
+    Args:
+        weights (:class:`~torchvision.models.ResNet101_Weights`, optional): The
+            pretrained weights to use. See
+            :class:`~torchvision.models.ResNet101_Weights` below for
+            more details, and possible values. By default, no pre-trained
+            weights are used.
+        progress (bool, optional): If True, displays a progress bar of the
+            download to stderr. Default is True.
+        **kwargs: parameters passed to the ``torchvision.models.resnet.ResNet``
+            base class. Please refer to the `source code
+            <https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>`_
+            for more details about this class.
+
+    .. autoclass:: torchvision.models.ResNet101_Weights
+        :members:
+    """
+    # weights = ResNet101_Weights.verify(weights)
+
+    return _resnet(Bottleneck, [3, 4, 23, 3], weights, progress, in_img_chs=1, **kwargs)
 
 
 @handle_legacy_interface(weights=("pretrained", ResNet152_Weights.IMAGENET1K_V1))
