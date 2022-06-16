@@ -10,7 +10,7 @@ from .._api import WeightsEnum, Weights
 from .._meta import _VOC_CATEGORIES
 from .._utils import IntermediateLayerGetter, handle_legacy_interface, _ovewrite_value_param
 from ..mobilenetv3 import MobileNetV3, MobileNet_V3_Large_Weights, mobilenet_v3_large
-from ..resnet import ResNet, resnet50, resnet101_1ch, ResNet50_Weights, ResNet101_Weights
+from ..resnet import ResNet, resnet50, resnet101, resnet101_nch, ResNet50_Weights, ResNet101_Weights
 from ._utils import _SimpleSegmentationModel
 from .fcn import FCNHead
 
@@ -65,23 +65,35 @@ class DeepLabV3Plus(_SimpleSegmentationModel):
 
 class MultiTaskModel(nn.Module):
     def __init__(
-        self, backbones: List[nn.Module], 
+        self, backbones: List[nn.Module], encoder_chs: List[int],
+        hl_project: nn.Module, ll_project: nn.Module,
         height_decoder: nn.Module, seg_decoder: nn.Module, aux_classifier: Optional[nn.Module] = None
         ) -> None:
         super().__init__()
         self.backbones = backbones
+        self.encoder_chs = encoder_chs
+        self.hl_project = hl_project
+        self.ll_project = ll_project
         self.height_decoder = height_decoder
         self.seg_decoder = seg_decoder
         self.aux_classifier = aux_classifier
 
     def forward(self, x):
         input_shape = x.shape[-2:]
-        assert x.shape[1] == len(self.backbones), 'channels in input not equal to number of encoders!'
+        assert x.shape[1] == sum(self.encoder_chs), 'channels in input not equal to sum of encoders input channels!'
         # contract: features is a dict of tensors
-        features_list = [ backbone(x[:,i:i+1]) for i, backbone in enumerate(self.backbones) ]
+        features_list = [
+            backbone(
+                x[:, sum(self.encoder_chs[:i]) : sum(self.encoder_chs[:i+1])]
+            ) for i, backbone in enumerate(self.backbones) 
+        ]
         features = {
-            'low_level': torch.cat([f['low_level'] for f in features_list], dim=1),
-            'out': torch.cat([f['out'] for f in features_list], dim=1)
+            'low_level': self.ll_project(
+                torch.cat([f['low_level'] for f in features_list], dim=1)
+            ),
+            'out': self.hl_project(
+                torch.cat([f['out'] for f in features_list], dim=1)
+            )
         }
         result = OrderedDict()
         height_x = self.height_decoder(features)
@@ -198,6 +210,30 @@ class ASPP(nn.Module):
         res = torch.cat(_res, dim=1)
         return self.project(res)
 
+class FeatureProjection(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            # nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+        )
+
+        self._init_weights()
+    
+    def forward(self, x):
+        return self.project(x)
+
+    def _init_weights(self): # need to do this because we have no pretraining for DeepLabV3+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
 
 def _deeplabv3_resnet(
     backbone: ResNet,
@@ -222,6 +258,7 @@ def _deeplabv3_resnet(
 
 def _multitask_model(
     backbones: List[nn.Module],
+    encoder_chs: List[int],
     num_seg_classes: int,
     aux: Optional[bool]
 ) -> MultiTaskModel:
@@ -232,11 +269,16 @@ def _multitask_model(
         IntermediateLayerGetter(backbone, return_layers=return_layers) for backbone in backbones
     ]
 
-    aux_classifier = FCNHead(1024, num_seg_classes) if aux else None # kind of useless tbh
-    height_decoder = DeepLabPlusHead(2048, 256, 1) # always one channel for height
-    seg_decoder = DeepLabPlusHead(2048, 256, num_seg_classes)
+    high_lvl_chs = 2048
+    low_lvl_chs = 256
+    high_lvl_project = FeatureProjection(high_lvl_chs*len(encoder_chs), high_lvl_chs)
+    low_lvl_project = FeatureProjection(low_lvl_chs*len(encoder_chs), low_lvl_chs)
 
-    return MultiTaskModel(backbones, height_decoder, seg_decoder, aux_classifier)
+    aux_classifier = FCNHead(1024, num_seg_classes) if aux else None # kind of useless tbh
+    height_decoder = DeepLabPlusHead(high_lvl_chs, low_lvl_chs, 1) # always one channel for height
+    seg_decoder = DeepLabPlusHead(high_lvl_chs, low_lvl_chs, num_seg_classes)
+
+    return MultiTaskModel(backbones, encoder_chs, high_lvl_project, low_lvl_project, height_decoder, seg_decoder, aux_classifier)
 
 def multitask_model(
     *,
@@ -281,7 +323,7 @@ def multitask_model(
         num_seg_classes = 21
 
     backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
-    model = _multitask_model(backbone, num_seg_classes, aux_loss)
+    model = _multitask_model([backbone], [3], num_seg_classes, aux_loss)
 
     if seg_weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))
@@ -290,7 +332,7 @@ def multitask_model(
 
 def multitask_model_multi_encoder(
     *,
-    num_encoders = 1,
+    encoder_chs = [1],
     weights: Optional[ResNet101_Weights] = None,
     progress: bool = True,
     num_seg_classes: Optional[int] = None,
@@ -333,9 +375,9 @@ def multitask_model_multi_encoder(
         num_seg_classes = 21
 
     backbones = [
-        resnet101_1ch(weights=weights_backbone, replace_stride_with_dilation=[False, True, True]) for _ in range(num_encoders)
+        resnet101_nch(in_img_chs=chs, weights=weights_backbone, replace_stride_with_dilation=[False, True, True]) for chs in encoder_chs
     ]
-    model = _multitask_model(backbones, num_seg_classes, aux_loss)
+    model = _multitask_model(backbones, encoder_chs, num_seg_classes, aux_loss)
 
     if seg_weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))

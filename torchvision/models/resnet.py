@@ -28,7 +28,7 @@ __all__ = [
     "resnet34",
     "resnet50",
     "resnet101",
-    "resnet101_1ch",
+    "resnet101_nch",
     "resnet152",
     "resnext50_32x4d",
     "resnext101_32x8d",
@@ -673,10 +673,11 @@ def resnet101(*, weights: Optional[ResNet101_Weights] = None, progress: bool = T
 
     return _resnet(Bottleneck, [3, 4, 23, 3], weights, progress, **kwargs)
 
-def resnet101_1ch(*, weights: Optional[ResNet101_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
+def resnet101_nch(*, in_img_chs: int, weights: Optional[ResNet101_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
     """ResNet-101 from `Deep Residual Learning for Image Recognition <https://arxiv.org/pdf/1512.03385.pdf>`__.
 
     Args:
+        in_img_chs (int): number of channels in input image
         weights (:class:`~torchvision.models.ResNet101_Weights`, optional): The
             pretrained weights to use. See
             :class:`~torchvision.models.ResNet101_Weights` below for
@@ -694,7 +695,7 @@ def resnet101_1ch(*, weights: Optional[ResNet101_Weights] = None, progress: bool
     """
     # weights = ResNet101_Weights.verify(weights)
 
-    return _resnet(Bottleneck, [3, 4, 23, 3], weights, progress, in_img_chs=1, **kwargs)
+    return _resnet(Bottleneck, [3, 4, 23, 3], weights, progress, in_img_chs=in_img_chs, **kwargs)
 
 
 @handle_legacy_interface(weights=("pretrained", ResNet152_Weights.IMAGENET1K_V1))
