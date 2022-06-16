@@ -65,7 +65,7 @@ class DeepLabV3Plus(_SimpleSegmentationModel):
 
 class MultiTaskModel(nn.Module):
     def __init__(
-        self, backbones: List[nn.Module], encoder_chs: List[int],
+        self, backbones: nn.ModuleList, encoder_chs: List[int],
         hl_project: nn.Module, ll_project: nn.Module,
         height_decoder: nn.Module, seg_decoder: nn.Module, aux_classifier: Optional[nn.Module] = None
         ) -> None:
@@ -257,7 +257,7 @@ def _deeplabv3_resnet(
         return DeepLabV3(backbone, classifier, aux_classifier)
 
 def _multitask_model(
-    backbones: List[nn.Module],
+    backbones: nn.ModuleList,
     encoder_chs: List[int],
     num_seg_classes: int,
     aux: Optional[bool]
@@ -265,9 +265,9 @@ def _multitask_model(
     return_layers = {"layer4": "out", "layer1": "low_level"}
     if aux:
         return_layers["layer3"] = "aux"
-    backbones = [
+    backbones = nn.ModuleList([
         IntermediateLayerGetter(backbone, return_layers=return_layers) for backbone in backbones
-    ]
+    ])
 
     high_lvl_chs = 2048
     low_lvl_chs = 256
@@ -323,7 +323,7 @@ def multitask_model(
         num_seg_classes = 21
 
     backbone = resnet101(weights=weights_backbone, replace_stride_with_dilation=[False, True, True])
-    model = _multitask_model([backbone], [3], num_seg_classes, aux_loss)
+    model = _multitask_model(nn.ModuleList([backbone]), [3], num_seg_classes, aux_loss)
 
     if seg_weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))
@@ -374,9 +374,9 @@ def multitask_model_multi_encoder(
     elif num_seg_classes is None:
         num_seg_classes = 21
 
-    backbones = [
+    backbones = nn.ModuleList([
         resnet101_nch(in_img_chs=chs, weights=weights_backbone, replace_stride_with_dilation=[False, True, True]) for chs in encoder_chs
-    ]
+    ])
     model = _multitask_model(backbones, encoder_chs, num_seg_classes, aux_loss)
 
     if seg_weights is not None:
